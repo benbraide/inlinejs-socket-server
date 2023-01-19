@@ -1,0 +1,57 @@
+{
+  "name": "@benbraide/inlinejs-socket-server",
+  "version": "1.0.4",
+  "description": "Run javascript code by embedding them in your HTML using the element as context.",
+  "main": "./lib/common/index.js",
+  "module": "./lib/esm/index.js",
+  "files": [
+    "lib/"
+  ],
+  "scripts": {
+    "test": "mocha -r jsdom-global/register lib/**/*.spec.js",
+    "ts-test": "mocha -r ts-node/register -r jsdom-global/register src/**/*.spec.ts",
+    "dbg-test": "mocha --inspect-brk -r ts-node/register -r jsdom-global/register src/**/*.spec.ts",
+    "compile": "tsc -p ./tsconfig.json && tsc -p ./tsconfig.esm.json",
+    "prepublishOnly": "npm run compile",
+    "upload": "npm publish --access=public",
+    "push": "npm i @benbraide/inlinejs && npm run upload"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/benbraide/inlinejs-socket-server.git"
+  },
+  "keywords": [
+    "javascript",
+    "reactive",
+    "framework",
+    "html",
+    "attribute",
+    "embed"
+  ],
+  "author": "Benebo Braide",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/benbraide/inlinejs-socket-server/issues"
+  },
+  "homepage": "https://github.com/benbraide/inlinejs-socket-server#readme",
+  "devDependencies": {
+    "@testing-library/dom": "^7.31.2",
+    "@testing-library/user-event": "^13.1.9",
+    "@types/chai": "^4.2.18",
+    "@types/mocha": "^8.2.2",
+    "chai": "^4.3.4",
+    "jsdom": "^16.6.0",
+    "jsdom-global": "^3.0.2",
+    "mocha": "^9.0.0",
+    "ts-loader": "^9.2.3",
+    "ts-node": "^10.0.0",
+    "webpack": "^5.41.0"
+  },
+  "dependencies": {
+    "@benbraide/inlinejs": "^1.0.27",
+    "socket.io": "^4.5.4",
+    "socket.io-client": "^4.5.4",
+    "sweetalert2": "^11.4.8",
+    "webpack-cli": "^4.7.2"
+  }
+}
