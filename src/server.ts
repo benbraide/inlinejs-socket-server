@@ -1,139 +1,181 @@
 import { Server, Socket } from 'socket.io';
-import { createServer, Server as ServerType } from 'http';
-import { IsObject } from '@benbraide/inlinejs';
+import { IsObject, JournalTry } from '@benbraide/inlinejs';
+import { CustomEventHandlerType, ICustomEventHandler, ISocketServer } from './types';
 
 const WEBSOCKET_CORS = {
    origin: '*',
    methods: ['GET', 'POST'],
 }
 
-type CustomEventHandlerType = (socket: Socket, ...args: any[]) => void;
+interface ICustomEventHandlerInfo{
+    room: string;
+    eventName: string;
+    handler: CustomEventHandlerType | ICustomEventHandler;
+}
 
-class SocketServer extends Server{
-    private static io_: SocketServer | null;
-    private static http_: ServerType | null;
+export class SocketServer extends Server implements ISocketServer{
+    protected customEventHandlers_ = new Array<ICustomEventHandlerInfo>();
+    protected logging_ = false;
 
-    private customEventHandlers_: Record<string, CustomEventHandlerType> = {};
-    private logging_ = false;
-
-    private eventHandler_: (...args: any[]) => void;
+    protected eventHandler_: (...args: any[]) => void;
     
     constructor(http: any){
         super(http, {
             cors: WEBSOCKET_CORS,
         });
 
-        const knownEvents = ['disconnecting', 'disconnect', 'error', 'subscribe', 'unsubscribe'];
+        const handleDisconnecting = (after: ((socket: Socket) => void) | null, socket: Socket) => {
+            this.logging_ && console.log(`Socket(${socket.id}) disconnecting.`);
+            for (const room of socket.rooms){// Alert clients in all rooms that the client was connected to that the client has disconnected
+                socket.to(room).emit('socket:unsubscribed', {
+                    room,
+                    id: socket.id,
+                });
+            }
+            after && after(socket);
+        };
+
+        const handleDisconnect = (after: ((socket: Socket) => void) | null, socket: Socket) => {
+            this.logging_ && console.log(`Socket(${socket.id}) disconnected.`);
+            after && after(socket);
+        };
+
+        const handleError = (after: ((socket: Socket) => void) | null, socket: Socket, error: any) => {
+            this.logging_ && console.log(`Socket(${socket.id}) error:`, error);
+            after && after(socket);
+        }
+
+        const handleSubscribe = (after: ((socket: Socket) => void) | null, socket: Socket, room: string) => {
+            this.logging_ && console.log(`Socket(${socket.id}) subscribing to room: ${room}`);
+            const response = socket.join(room), subscribed = () => {
+                this.logging_ && console.log(`Socket(${socket.id}) subscribed to room: ${room}`);
+                
+                socket.emit('socket:join', { room });// Alert the client that they have joined the room
+
+                this.in(room).fetchSockets().then(sockets => {
+                    socket.emit('socket:subscribe', {// Alert the client that they have subscribed with the list of sockets in the room
+                        room,
+                        clients: sockets.map(s => s.id),
+                    });
+                });
+                
+                socket.to(room).emit('socket:subscribe', {// Alert all clients in room that a new client has joined
+                    room,
+                    clients: [socket.id],
+                });
+
+                after && after(socket);
+            };
+
+            (response instanceof Promise) ? response.then(subscribed) : subscribed();
+        };
+
+        const handleUnsubscribe = (after: ((socket: Socket) => void) | null, socket: Socket, room: string) => {
+            this.logging_ && console.log(`Socket(${socket.id}) unsubscribing from room: ${room}`);
+            const response = socket.leave(room), unsubscribed = () => {
+                this.logging_ && console.log(`Socket(${socket.id}) unsubscribed from room: ${room}`);
+                
+                socket.to(room).emit('socket:unsubscribe', {// Alert all clients in room that a client has left
+                    room,
+                    id: socket.id,
+                });
+                socket.emit('socket:leave', { room });// Alert the client that they have left the room
+
+                after && after(socket);
+            };
+
+            (response instanceof Promise) ? response.then(unsubscribed) : unsubscribed();
+        };
+
+        const handlers = {
+            'socket:subscribe': handleSubscribe,
+            'socket:join': handleSubscribe,
+            'socket:unsubscribe': handleUnsubscribe,
+            'socket:leave': handleUnsubscribe,
+        };
         
         this.eventHandler_ = (socket: Socket) => {
-            if (this.logging_){
-                console.log(`Socket(${socket.id}) connected.`);
-            }
+            this.logging_ && console.log(`Socket(${socket.id}) connected.`);
+
+            const callHandler = (handler: CustomEventHandlerType | ICustomEventHandler, room: string, eventName: string, ...args: any[]) => {
+                const params = { server: this, socket, room, eventName, args };
+                return ((typeof handler === 'function') ? handler(params) : handler.Handle(params));
+            };
+            
+            const callCustomEventHandler = (room: string, eventName: string, ...args: any[]) => {
+                let afters = new Array<(socket: Socket) => void>(), isRejected = false;
+
+                const customHandlers = this.FindCustomEventHandlers_(room, eventName);
+                this.logging_ && console.log(`Socket(${socket.id}) found ${customHandlers.length} custom handlers for event: ${eventName}`, ...args);
+                
+                customHandlers.forEach((info) => JournalTry(() => {
+                    const response = callHandler(info.handler, room, eventName, ...args);
+                    if (typeof response === 'function'){
+                        afters.push(response);
+                    }
+                    else if (response === false){
+                        isRejected = true;
+                    }
+                }));
+
+                return isRejected ? false : () => afters.forEach(after => JournalTry(() => after(socket)));
+            };
 
             socket.onAny((eventName, ...args) => {
-                if (knownEvents.includes(eventName)){
-                    return;
-                }
-                
-                if (this.customEventHandlers_.hasOwnProperty(eventName)){
-                    if (this.logging_){
-                        console.log(`Socket(${socket.id}) custom event received: ${eventName}`, ...args);
-                    }
-
-                    this.customEventHandlers_[eventName](socket, ...args);
-
-                    return;
-                }
-                
-                if (this.logging_){
-                    console.log(`Socket(${socket.id}) event received: ${eventName}`, ...args);
-                }
-
                 const message = args[0];
-                if (IsObject(message) && message.room && typeof message.room === 'string'){// Message is a room message
-                    socket.to(message.room).emit(eventName, ...args);
+                let room: string;
+
+                // Determine room for custom event handler filtering and for custom event broadcasting
+                if ((eventName in handlers) && typeof message === 'string') {
+                    room = message; // For built-in events, the room is the payload string
+                } else if (IsObject(message) && message.room && typeof message.room === 'string') {
+                    room = message.room; // For custom events, it's in the payload object
+                } else {
+                    room = '*'; // Default/wildcard
                 }
-                else{// Message is a broadcast message
-                    socket.broadcast.emit(eventName, ...args);
+                
+                const after = callCustomEventHandler(room, eventName, ...args);
+                if (after === false){
+                    return;
+                }
+                
+                if (eventName in handlers){
+                    // Handle known events. The room is the first argument.
+                    handlers[eventName](after, socket, ...args);
+                }
+                else{// It's a custom event, broadcast it
+                    (room === '*') ? socket.broadcast.emit(eventName, ...args) : socket.to(room).emit(eventName, ...args);
+                    after && after();
                 }
             });
-            
+
             socket.on('disconnecting', () => {
-                if (this.logging_){
-                    console.log(`Socket(${socket.id}) disconnecting.`);
-                }
-                
-                for (const room of socket.rooms){// Alert clients in all rooms that the client was connected to that the client has disconnected
-                    socket.to(room).emit('unsubscribed', {
-                        room,
-                        id: socket.id,
-                    });
+                const after = callCustomEventHandler('*', 'socket:disconnecting');
+                if (after !== false){
+                    handleDisconnecting(after, socket);
                 }
             });
 
             socket.on('disconnect', () => {
-                if (this.logging_){
-                    console.log(`Socket(${socket.id}) disconnected.`);
+                const after = callCustomEventHandler('*', 'socket:disconnect');
+                if (after !== false){
+                    handleDisconnect(after, socket);
                 }
             });
 
             socket.on('error', (error) => {
-                console.log('error', error);
-            });
-
-            socket.on('subscribe', (room: string) => {
-                if (this.logging_){
-                    console.log(`Socket(${socket.id}) subscribing to room: ${room}`);
+                const after = callCustomEventHandler('*', 'socket:error', error);
+                if (after !== false){
+                    handleError(after, socket, error);
                 }
-                
-                let subscribed = () => {
-                    if (this.logging_){
-                        console.log(`Socket(${socket.id}) subscribed to room: ${room}`);
-                    }
-                    
-                    this.in(room).fetchSockets().then(sockets => {
-                        socket.emit('subscribed', {// Alert the client that they have subscribed with the list of sockets in the room
-                            room,
-                            clients: sockets.map(s => s.id),
-                        });
-                    });
-                    
-                    socket.to(room).emit('subscribed', {// Alert all clients in room that a new client has joined
-                        room,
-                        clients: [socket.id],
-                    });
-
-                    socket.emit('joined', room);// Alert the client that they have joined the room
-                }, response = socket.join(room);
-
-                (response instanceof Promise) ? response.then(subscribed) : subscribed();
             });
 
-            socket.on('unsubscribe', (room: string) => {
-                if (this.logging_){
-                    console.log(`Socket(${socket.id}) unsubscribing from room: ${room}`);
-                }
-                
-                let unsubscribed = () => {
-                    if (this.logging_){
-                        console.log(`Socket(${socket.id}) unsubscribed from room: ${room}`);
-                    }
-                    
-                    socket.emit('left', room);// Alert the client that they have left the room
-                    
-                    socket.to(room).emit('unsubscribed', {// Alert all clients in room that a client has left
-                        room,
-                        id: socket.id,
-                    });
-                }, response = socket.leave(room);
-
-                (response instanceof Promise) ? response.then(unsubscribed) : unsubscribed();
-            });
-
-            socket.emit('connected', socket.id);// Echo socket ID to the client that connected
+            const after = callCustomEventHandler('*', 'socket:connect');
+            if (after !== false){
+                socket.emit('socket:connect', socket.id);// Echo socket ID to the client that connected
+                after && after();
+            }
         };
-        
-        SocketServer.http_ = http;
     }
 
     public get Logging(){
@@ -144,12 +186,25 @@ class SocketServer extends Server{
         this.logging_ = value;
     }
 
-    public AddCustomEventHandler(eventName: string, handler: CustomEventHandlerType){
-        this.customEventHandlers_[eventName] = handler;
+    public AddCustomEventHandler(handler: CustomEventHandlerType | ICustomEventHandler, eventName = '*', room = '*'){
+        let info: ICustomEventHandlerInfo;
+        if (typeof handler !== 'function'){
+            info = {
+                room: (handler.GetRoom() || room),
+                eventName: (handler.GetEventName() || eventName),
+                handler,
+            };
+        }
+        else{
+            info = { room, eventName, handler };
+        }
+        
+        info.eventName && this.customEventHandlers_.push(info);
     }
 
-    public RemoveCustomEventHandler(eventName: string){
-        delete this.customEventHandlers_[eventName];
+    public RemoveCustomEventHandler(handler: CustomEventHandlerType | ICustomEventHandler){
+        const index = this.customEventHandlers_.findIndex(h => h.handler === handler);
+        (index >= 0) && this.customEventHandlers_.splice(index, 1);
     }
 
     public Start(){
@@ -160,26 +215,8 @@ class SocketServer extends Server{
         this.off('connection', this.eventHandler_);
     }
 
-    public static GetInstance(listener?: any, http?: any): SocketServer{
-        if (!SocketServer.io_) {
-            SocketServer.io_ = new SocketServer(http || SocketServer.GetHttpServer(listener));
-        }
-        
-        return SocketServer.io_;
-    }
-
-    public static DestroyInstance(){
-        SocketServer.io_?.Stop();
-        SocketServer.io_?.close();
-        SocketServer.io_ = null;
-    }
-
-    public static GetHttpServer(listener?: any): ServerType{
-        if (!SocketServer.http_){
-            SocketServer.http_ = createServer(listener);
-        }
-        
-        return SocketServer.http_;
+    protected FindCustomEventHandlers_(room: string, eventName: string){
+        return this.customEventHandlers_.filter(h => (h.room === '*' || h.room === room) && (h.eventName === '*' || h.eventName === eventName));
     }
 }
 
